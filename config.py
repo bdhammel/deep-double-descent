@@ -1,0 +1,23 @@
+from yacs.config import CfgNode as CN
+
+
+_C = CN()
+
+_C.SYSTEM = CN()
+_C.SYSTEM.DEVICE = 'cuda:0'
+_C.SYSTEM.NUM_WORKERS = 4
+
+_C.TRAIN = CN()
+_C.TRAIN.BATCH_SIZE = 8
+_C.TRAIN.LEARNING_RATE = 1e-4
+_C.TRAIN.STEPS = 500_000
+
+_C.MODEL = CN()
+_C.MODEL.D = 5
+_C.MODEL.W = 500
+
+_C.DATA = CN()
+_C.DATA.N_POINTS = 1000
+_C.DATA.NOISE = .5
+
+cfg = _C

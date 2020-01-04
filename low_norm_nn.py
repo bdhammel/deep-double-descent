@@ -1,38 +1,40 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils import data
 import numpy as np
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from datetime import datetime
 
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter, writer
+from config import cfg
 
-N = 100
-BATCHES = 100_000
-BATCH_SZ = 32
-D = 3
-W = 100
 
-writer = SummaryWriter(f'./logs/{datetime.now()}')
+_WRITER = SummaryWriter()
+
+
+def _add_hparams(hparam_dict, metric_dict):
+    exp, ssi, sei = writer.hparams(hparam_dict, {})
+    _WRITER.file_writer.add_summary(exp)
+    _WRITER.file_writer.add_summary(ssi)
+    _WRITER.file_writer.add_summary(sei)
 
 
 def twospirals(n_points, noise=.5):
-    """Returns the two spirals dataset."""
+    """Returns the two spirals dataset"""
     n = np.sqrt(np.random.rand(n_points, 1)) * 780 * (2*np.pi)/360
     d1x = -np.cos(n)*n + np.random.rand(n_points, 1) * noise
     d1y = np.sin(n)*n + np.random.rand(n_points, 1) * noise
-    d1x /= d1x.max()
-    d1y /= d1y.max()
+    max_ = max(np.abs(d1x).max(), np.abs(d1y).max())
+    d1x /= max_
+    d1y /= max_
     return (np.vstack((np.hstack((d1x, d1y)), np.hstack((-d1x, -d1y)))),
             np.hstack((np.zeros(n_points), np.ones(n_points))))
 
 
 class Net(nn.Module):
 
-    def __init__(self, D=1, W=100):
+    def __init__(self, D, W):
         super().__init__()
         self.D = D
         self.fc_in = nn.Linear(2, W)
@@ -55,15 +57,15 @@ class Net(nn.Module):
 
 
 def get_data():
-    X, y = twospirals(1000)
+    X, y = twospirals(cfg.DATA.N_POINTS, noise=cfg.DATA.NOISE)
     Y = y.reshape(-1, 1)
-    return train_test_split(X, Y, test_size=0.33, random_state=42)
+    return train_test_split(X, Y, test_size=0.91, random_state=42)
 
 
 def inf_data_gen(X, y):
     all_idx = list(range(len(X)))
     while True:
-        idx = np.random.choice(all_idx, replace=False, size=BATCH_SZ)
+        idx = np.random.choice(all_idx, replace=False, size=cfg.TRAIN.BATCH_SIZE)
         x_batch = X[idx]
         y_batch = y[idx]
         yield torch.Tensor(x_batch), torch.Tensor(y_batch)
@@ -74,40 +76,52 @@ def train(net, X, T, optimizer, n_iter):
     loss = F.binary_cross_entropy(L, T)
     loss.backward()
     optimizer.step()
-    writer.add_scalar('Loss/train', loss.item(), n_iter)
+    _WRITER.add_scalar('Loss/train', loss.item(), n_iter)
 
 
 def test(net, X, T, n_iter):
     with torch.no_grad():
         L = net(X)
         loss = F.binary_cross_entropy(L, T)
-        writer.add_scalar('Loss/test', loss.item(), n_iter)
+        _WRITER.add_scalar('Loss/test', loss.item(), n_iter)
+
+
+def analysis(net, x_train, y_train, n_iter=None):
+    x = np.linspace(-2, 2, 150)
+    XX, YY = np.meshgrid(x, x)
+    X = torch.Tensor(np.c_[XX.ravel(), YY.ravel()]).to(cfg.SYSTEM.DEVICE)
+    p = net(X).detach().cpu().numpy().reshape(150, 150)
+    fig = Figure()
+    ax = fig.subplots()
+    ax.pcolormesh(XX, YY, p, cmap='bwr', vmin=0, vmax=1, alpha=.5)
+    ax.scatter(x_train[:, 0], x_train[:, 1], c=y_train[:, 0])
+    _WRITER.add_figure('final_output', fig, n_iter)
 
 
 if __name__ == '__main__':
 
+    _add_hparams({**cfg.TRAIN, **cfg.MODEL, **cfg.DATA}, {})
+
     x_train, x_test, y_train, y_test = get_data()
     train_dataloader = inf_data_gen(x_train, y_train)
-    X_test = torch.Tensor(x_test)
-    Y_test = torch.Tensor(y_test)
+    X_test = torch.Tensor(x_test).to(cfg.SYSTEM.DEVICE)
+    Y_test = torch.Tensor(y_test).to(cfg.SYSTEM.DEVICE)
 
-    net = Net(D=3)
+    net = Net(D=cfg.MODEL.D, W=cfg.MODEL.W)
+    net.to(cfg.SYSTEM.DEVICE)
 
-    optimizer = torch.optim.SGD(net.parameters(), lr=0.00001, momentum=0.9)
-    train_dataloader
-    pbar = tqdm(train_dataloader, total=BATCHES)
-    for n_iter, (X, T) in enumerate(pbar):
+    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.TRAIN.LEARNING_RATE)
+    pbar = tqdm(train_dataloader, total=cfg.TRAIN.STEPS)
+    for n_iter, (X, T) in enumerate(pbar, start=1):
+        X, T = X.to(cfg.SYSTEM.DEVICE), T.to(cfg.SYSTEM.DEVICE)
         optimizer.zero_grad()
         net.train()
         train(net, X, T, optimizer, n_iter)
         net.eval()
         test(net, X_test, Y_test, n_iter)
-        if n_iter > BATCHES:
-            break
 
-    x = np.linspace(-1, 1, 50)
-    XX, YY = np.meshgrid(x, x)
-    env = np.c_[XX.ravel(), YY.ravel()]
-    p = net(torch.Tensor(env)).detach().numpy().reshape(50, 50)
-    plt.pcolormesh(XX, YY, p, cmap='bwr', vmin=0, vmax=1)
-    plt.scatter(X_test[:,0], X_test[:,1], c=y_test[:,0])
+        if n_iter % (cfg.TRAIN.STEPS / 10) == 0:
+            analysis(net, x_train, y_train, n_iter)
+
+        if n_iter > cfg.TRAIN.STEPS:
+            break
