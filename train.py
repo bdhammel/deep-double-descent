@@ -1,12 +1,16 @@
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
 from matplotlib.figure import Figure
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter, writer
+from data import inf_data_gen, get_data
+
 from config import cfg
 
 
@@ -18,18 +22,6 @@ def _add_hparams(hparam_dict, metric_dict):
     _WRITER.file_writer.add_summary(exp)
     _WRITER.file_writer.add_summary(ssi)
     _WRITER.file_writer.add_summary(sei)
-
-
-def twospirals(n_points, noise=.5):
-    """Returns the two spirals dataset"""
-    n = np.sqrt(np.random.rand(n_points, 1)) * 780 * (2*np.pi)/360
-    d1x = -np.cos(n)*n + np.random.rand(n_points, 1) * noise
-    d1y = np.sin(n)*n + np.random.rand(n_points, 1) * noise
-    max_ = max(np.abs(d1x).max(), np.abs(d1y).max())
-    d1x /= max_
-    d1y /= max_
-    return (np.vstack((np.hstack((d1x, d1y)), np.hstack((-d1x, -d1y)))),
-            np.hstack((np.zeros(n_points), np.ones(n_points))))
 
 
 class Net(nn.Module):
@@ -56,34 +48,24 @@ class Net(nn.Module):
         return x
 
 
-def get_data():
-    X, y = twospirals(cfg.DATA.N_POINTS, noise=cfg.DATA.NOISE)
-    Y = y.reshape(-1, 1)
-    return train_test_split(X, Y, test_size=0.91, random_state=42)
-
-
-def inf_data_gen(X, y):
-    all_idx = list(range(len(X)))
-    while True:
-        idx = np.random.choice(all_idx, replace=False, size=cfg.TRAIN.BATCH_SIZE)
-        x_batch = X[idx]
-        y_batch = y[idx]
-        yield torch.Tensor(x_batch), torch.Tensor(y_batch)
-
-
 def train(net, X, T, optimizer, n_iter):
-    L = net(X)
-    loss = F.binary_cross_entropy(L, T)
+    P = net(X)
+    loss = F.binary_cross_entropy(P, T)
     loss.backward()
     optimizer.step()
     _WRITER.add_scalar('Loss/train', loss.item(), n_iter)
 
 
+def error(P, T):
+    return 1 - torch.sum(torch.round(P) == T).float() / len(T)
+
+
 def test(net, X, T, n_iter):
     with torch.no_grad():
-        L = net(X)
-        loss = F.binary_cross_entropy(L, T)
+        P = net(X)
+        loss = F.binary_cross_entropy(P, T)
         _WRITER.add_scalar('Loss/test', loss.item(), n_iter)
+        _WRITER.add_scalar('Error/test', error(P, T), n_iter)
 
 
 def analysis(net, x_train, y_train, n_iter=None):
@@ -98,27 +80,47 @@ def analysis(net, x_train, y_train, n_iter=None):
     _WRITER.add_figure('final_output', fig, n_iter)
 
 
+def inv_root_lr(step):
+    return 1 / np.sqrt(1 + step // 50_000)
+
+
+def get_lr(optimizer):
+    lrs = []
+    for param_group in optimizer.param_groups:
+        lrs.append(param_group['lr'])
+    assert len(set(lrs)) == 1
+    return lrs[0]
+
+
 if __name__ == '__main__':
+
+    cfg.merge_from_list(['MODEL.W', int(sys.argv[1])])
 
     _add_hparams({**cfg.TRAIN, **cfg.MODEL, **cfg.DATA}, {})
 
     x_train, x_test, y_train, y_test = get_data()
-    train_dataloader = inf_data_gen(x_train, y_train)
+    train_dataloader = inf_data_gen(x_train, y_train, cfg.TRAIN.BATCH_SIZE)
     X_test = torch.Tensor(x_test).to(cfg.SYSTEM.DEVICE)
     Y_test = torch.Tensor(y_test).to(cfg.SYSTEM.DEVICE)
 
     net = Net(D=cfg.MODEL.D, W=cfg.MODEL.W)
     net.to(cfg.SYSTEM.DEVICE)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.TRAIN.LEARNING_RATE)
+    optimizer = torch.optim.SGD(net.parameters(), lr=cfg.TRAIN.LEARNING_RATE)
+    scheduler = LambdaLR(optimizer, lr_lambda=inv_root_lr)
     pbar = tqdm(train_dataloader, total=cfg.TRAIN.STEPS)
     for n_iter, (X, T) in enumerate(pbar, start=1):
         X, T = X.to(cfg.SYSTEM.DEVICE), T.to(cfg.SYSTEM.DEVICE)
         optimizer.zero_grad()
         net.train()
         train(net, X, T, optimizer, n_iter)
-        net.eval()
-        test(net, X_test, Y_test, n_iter)
+
+        if n_iter % 5000 == 0:
+            net.eval()
+            test(net, X_test, Y_test, n_iter)
+            _WRITER.add_scalar('LR', get_lr(optimizer), n_iter)
+
+        scheduler.step(n_iter)
 
         if n_iter % (cfg.TRAIN.STEPS / 10) == 0:
             analysis(net, x_train, y_train, n_iter)
