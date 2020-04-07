@@ -38,7 +38,11 @@ def get_data():
 def inf_data_gen(X, y, batch_size):
     all_idx = list(range(len(X)))
     while True:
-        idx = np.random.choice(all_idx, replace=False, size=batch_size)
-        x_batch = X[idx]
-        y_batch = y[idx]
+        if batch_size > 0:
+            idx = np.random.choice(all_idx, replace=False, size=batch_size)
+            x_batch = X[idx]
+            y_batch = y[idx]
+        else:
+            x_batch = X
+            y_batch = y
         yield torch.Tensor(x_batch), torch.Tensor(y_batch)

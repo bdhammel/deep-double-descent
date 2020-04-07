@@ -8,7 +8,7 @@ def run_command(command, file_path, flag):
 
 
 def model_capacity():
-    widths = range(3, 60, 3)
+    widths = range(120, 200, 5)
     for width in widths:
         print("Training network with width: ", width)
         run_command('python', './train.py', str(width))
